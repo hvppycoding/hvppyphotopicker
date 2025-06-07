@@ -4,6 +4,8 @@ import os
 import shutil
 import glob
 import platform
+import subprocess
+from datetime import datetime
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PIL import Image
 from .grouper import PhotoGrouper
@@ -51,11 +53,13 @@ class PhotoPickerApp(QtWidgets.QWidget):
         self.btn_output = QtWidgets.QPushButton("Select Export Folder")
         self.btn_merge = QtWidgets.QPushButton("Merge Groups")
         self.btn_split = QtWidgets.QPushButton("Split Group")
+        self.btn_video = QtWidgets.QPushButton("Make Group Video")
         self.btn_export = QtWidgets.QPushButton("Export Selected")
         top_bar.addWidget(self.btn_input)
         top_bar.addWidget(self.btn_output)
         top_bar.addWidget(self.btn_merge)
         top_bar.addWidget(self.btn_split)
+        top_bar.addWidget(self.btn_video)
         top_bar.addWidget(self.btn_export)
 
         self.splitter = QtWidgets.QSplitter()
@@ -110,6 +114,7 @@ class PhotoPickerApp(QtWidgets.QWidget):
         self.btn_export.clicked.connect(self.export_selected)
         self.btn_merge.clicked.connect(self.merge_groups)
         self.btn_split.clicked.connect(self.split_group)
+        self.btn_video.clicked.connect(self.make_group_video)
 
         if platform.system() == "Darwin":
             mod = "Meta"
@@ -152,15 +157,25 @@ class PhotoPickerApp(QtWidgets.QWidget):
                 if group:
                     filename = os.path.basename(group[0])
                     self.progress_dialog.setLabelText(f"Analyzing {filename} ({processed + 1}/{total})")
-                    best = self.pick_least_blurry(group)
+                    if len(group) == 1:
+                        best = group[0]
+                    else:
+                        best = self.pick_least_blurry(group)
                     self.selected_images.add(best)
                 processed += len(group)
                 self.progress_dialog.setValue(processed)
                 QtWidgets.QApplication.processEvents()
 
             self.group_list.clear()
-            for i in range(len(self.groups)):
-                self.group_list.addItem(f"Group {i + 1}")
+            for i, group in enumerate(self.groups):
+                selected_count = sum(1 for p in group if p in self.selected_images)
+                total_count = len(group)
+                if group:
+                    timestamp = datetime.fromtimestamp(os.path.getmtime(group[0])).strftime("%y%m%d_%H%M%S")
+                    group_label = f"{timestamp} ({selected_count}/{total_count})"
+                else:
+                    group_label = f"Group {i + 1} ({selected_count}/{total_count})"
+                self.group_list.addItem(group_label)
 
             self.load_group()
             if self.progress_dialog:
@@ -194,8 +209,20 @@ class PhotoPickerApp(QtWidgets.QWidget):
             layout.setSpacing(2)
 
             label = QtWidgets.QLabel()
-            pixmap = QtGui.QPixmap(path).scaledToHeight(100, QtCore.Qt.SmoothTransformation)
-            label.setPixmap(pixmap)
+            # Use OpenCV to load and resize the image, fallback to Qt if fails
+            img_cv = cv2.imread(path)
+            if img_cv is not None:
+                img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+                h = 100
+                scale = h / img_cv.shape[0]
+                w = int(img_cv.shape[1] * scale)
+                resized = cv2.resize(img_cv, (w, h), interpolation=cv2.INTER_AREA)
+                qimg = QtGui.QImage(resized.data, resized.shape[1], resized.shape[0], resized.strides[0], QtGui.QImage.Format_RGB888)
+                pixmap = QtGui.QPixmap.fromImage(qimg)
+                label.setPixmap(pixmap)
+            else:
+                pixmap = QtGui.QPixmap(path).scaledToHeight(100, QtCore.Qt.SmoothTransformation)
+                label.setPixmap(pixmap)
             label.setAlignment(QtCore.Qt.AlignCenter)
             label.mousePressEvent = lambda e, p=path, idx=i: self.select_image(idx, p)
 
@@ -227,6 +254,11 @@ class PhotoPickerApp(QtWidgets.QWidget):
         self.group_list.setCurrentRow(self.current_group_index)
         self.show_preview(group[self.selected_image_index])
         self.highlight_selected_thumbnail()
+        # Update group list item text with selected/total count
+        if self.group_list.currentItem() is not None:
+            self.group_list.currentItem().setText(
+                f"Group {self.current_group_index + 1} ({sum(1 for p in group if p in self.selected_images)}/{len(group)})"
+            )
 
     def select_image(self, idx, path):
         self.selected_image_index = idx
@@ -382,3 +414,43 @@ class PhotoPickerApp(QtWidgets.QWidget):
 
     def was_cancelled(self):
         return self.progress_dialog.wasCanceled() if self.progress_dialog else False
+
+
+    def make_group_video(self):
+        if not self.groups:
+            return
+
+        group = self.groups[self.current_group_index]
+        if not group:
+            return
+
+        framerate, ok = QtWidgets.QInputDialog.getInt(self, "Frame Rate", "Enter frame rate (fps):", 5, 1, 60)
+        if not ok:
+            return
+
+        temp_dir = os.path.join(self.input_folder, "__temp_ffmpeg")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        for i, path in enumerate(group):
+            ext = os.path.splitext(path)[1].lower()
+            temp_path = os.path.join(temp_dir, f"{i:04d}.jpg")
+            img = Image.open(path)
+            img.save(temp_path, "JPEG")
+
+        # Use first image's modified time
+        timestamp = datetime.fromtimestamp(os.path.getmtime(group[0])).strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(self.input_folder, f"{timestamp}.mp4")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-framerate", str(framerate),
+            "-i", os.path.join(temp_dir, "%04d.jpg"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            output_path
+        ]
+        subprocess.run(cmd)
+
+        shutil.rmtree(temp_dir)
+        QtWidgets.QMessageBox.information(self, "Done", f"Saved video as:\n{output_path}")
